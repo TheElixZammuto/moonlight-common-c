@@ -18,7 +18,7 @@ static int activeThreads = 0;
 static int activeMutexes = 0;
 static int activeEvents = 0;
 
-#if defined(LC_WINDOWS)
+#if defined(LC_WINDOWS) && !defined(LC_UWP)
 
 #pragma pack(push, 8)
 typedef struct tagTHREADNAME_INFO
@@ -77,7 +77,7 @@ void* ThreadProc(void* context) {
     struct thread_context* ctx = (struct thread_context*)context;
 #endif
 
-#if defined(LC_WINDOWS)
+#if defined(LC_WINDOWS) && !defined(LC_UWP)
     setThreadNameWin32(ctx->name);
 #elif defined(__linux__)
     pthread_setname_np(pthread_self(), ctx->name);
