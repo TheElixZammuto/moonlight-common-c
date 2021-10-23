@@ -6,3 +6,17 @@ limelight-common/Release/
 *.sdf
 *.suo
 limelight-common/limelight-common.vcxproj.user
+ALL_BUILD.vcxproj
+ALL_BUILD.vcxproj.filters
+CMakeCache.txt
+CMakeFiles/
+Debug/
+Release/
+ZERO_CHECK.vcxproj
+ZERO_CHECK.vcxproj.filters
+cmake_install.cmake
+moonlight-common-c.dir/
+moonlight-common-c.sln
+moonlight-common-c.vcxproj
+moonlight-common-c.vcxproj.filters
+moonlight-common-c.vcxproj.user
