@@ -4,20 +4,37 @@ static SOCKET inputSock = INVALID_SOCKET;
 static unsigned char currentAesIv[16];
 static bool initialized;
 static bool encryptedControlStream;
+static bool needsBatchedScroll;
+static int batchedScrollDelta;
 static PPLT_CRYPTO_CONTEXT cryptoContext;
 
 static LINKED_BLOCKING_QUEUE packetQueue;
 static LINKED_BLOCKING_QUEUE packetHolderFreeList;
 static PLT_THREAD inputSendThread;
 
+static float absCurrentPosX;
+static float absCurrentPosY;
+
+#define CLAMP(val, min, max) (((val) < (min)) ? (min) : (((val) > (max)) ? (max) : (val)))
+
 #define MAX_INPUT_PACKET_SIZE 128
 #define INPUT_STREAM_TIMEOUT_SEC 10
 
 #define MAX_QUEUED_INPUT_PACKETS 150
 
+#define PAYLOAD_SIZE(x) BE32((x)->packet.header.size)
+#define PACKET_SIZE(x) (PAYLOAD_SIZE(x) + sizeof(uint32_t))
+
+// Matches Win32 WHEEL_DELTA definition
+#define LI_WHEEL_DELTA 120
+
 // Contains input stream packets
 typedef struct _PACKET_HOLDER {
-    int packetLength;
+    LINKED_BLOCKING_QUEUE_ENTRY entry;
+
+    // The union must be the last member since we abuse the NV_UNICODE_PACKET
+    // text field to store variable length data which gets split before being
+    // sent to the host.
     union {
         NV_INPUT_HEADER header;
         NV_KEYBOARD_PACKET keyboard;
@@ -27,10 +44,10 @@ typedef struct _PACKET_HOLDER {
         NV_CONTROLLER_PACKET controller;
         NV_MULTI_CONTROLLER_PACKET multiController;
         NV_SCROLL_PACKET scroll;
+        SS_HSCROLL_PACKET hscroll;
         NV_HAPTICS_PACKET haptics;
         NV_UNICODE_PACKET unicode;
     } packet;
-    LINKED_BLOCKING_QUEUE_ENTRY entry;
 } PACKET_HOLDER, *PPACKET_HOLDER;
 
 // Initializes the input stream
@@ -44,6 +61,18 @@ int initializeInputStream(void) {
 
     cryptoContext = PltCreateCryptoContext();
     encryptedControlStream = APP_VERSION_AT_LEAST(7, 1, 431);
+
+    // FIXME: Unsure if this is exactly right, but it's probably good enough.
+    //
+    // GFE 3.13.1.30 is not using NVVHCI for mouse/keyboard (and is confirmed unaffected)
+    // GFE 3.15.0.164 seems to be the first release using NVVHCI for mouse/keyboard
+    //
+    // Sunshine also uses SendInput() so it's not affected either.
+    needsBatchedScroll = APP_VERSION_AT_LEAST(7, 1, 409) && !IS_SUNSHINE();
+    batchedScrollDelta = 0;
+
+    // Start with the virtual mouse centered
+    absCurrentPosX = absCurrentPosY = 0.5f;
     return 0;
 }
 
@@ -112,10 +141,10 @@ static int encryptData(unsigned char* plaintext, int plaintextLen,
 }
 
 static void freePacketHolder(PPACKET_HOLDER holder) {
-    LC_ASSERT(holder->packetLength != 0);
+    LC_ASSERT(holder->packet.header.size != 0);
 
     // Place the packet holder back into the free list if it's a standard size entry
-    if (holder->packetLength > (int)sizeof(*holder) || LbqOfferQueueItem(&packetHolderFreeList, holder, &holder->entry) != LBQ_SUCCESS) {
+    if (PACKET_SIZE(holder) > (int)sizeof(*holder) || LbqOfferQueueItem(&packetHolderFreeList, holder, &holder->entry) != LBQ_SUCCESS) {
         free(holder);
     }
 }
@@ -154,13 +183,11 @@ static PPACKET_HOLDER allocatePacketHolder(int extraLength) {
 static bool sendInputPacket(PPACKET_HOLDER holder) {
     SOCK_RET err;
 
-    LC_ASSERT(holder->packet.header.size == BE32(holder->packetLength - sizeof(uint32_t)));
-
     // On GFE 3.22, the entire control stream is encrypted (and support for separate RI encrypted)
     // has been removed. We send the plaintext packet through and the control stream code will do
     // the encryption.
     if (encryptedControlStream) {
-        err = (SOCK_RET)sendInputPacketOnControlStream((unsigned char*)&holder->packet, holder->packetLength);
+        err = (SOCK_RET)sendInputPacketOnControlStream((unsigned char*)&holder->packet, PACKET_SIZE(holder));
         if (err < 0) {
             Limelog("Input: sendInputPacketOnControlStream() failed: %d\n", (int) err);
             ListenerCallbacks.connectionTerminated(err);
@@ -174,7 +201,7 @@ static bool sendInputPacket(PPACKET_HOLDER holder) {
 
         // Encrypt the message into the output buffer while leaving room for the length
         encryptedSize = sizeof(encryptedBuffer) - sizeof(encryptedLengthPrefix);
-        err = encryptData((unsigned char*)&holder->packet, holder->packetLength,
+        err = encryptData((unsigned char*)&holder->packet, PACKET_SIZE(holder),
             (unsigned char*)&encryptedBuffer[sizeof(encryptedLengthPrefix)], (int*)&encryptedSize);
         if (err != 0) {
             Limelog("Input: Encryption failed: %d\n", (int)err);
@@ -367,17 +394,49 @@ static void inputSendThreadProc(void* context) {
         // If it's a UTF-8 text packet, we may need to split it into a several packets to send
         else if (holder->packet.header.magic == LE32(UTF8_TEXT_EVENT_MAGIC)) {
             PACKET_HOLDER splitPacket;
-            uint32_t totalLength = BE32(holder->packet.unicode.header.size) - sizeof(uint32_t);
+            uint32_t totalLength = PAYLOAD_SIZE(holder) - sizeof(uint32_t);
             uint32_t i = 0;
 
-            while (i < totalLength) {
-                uint32_t copyLength = totalLength - i < UTF8_TEXT_EVENT_MAX_COUNT ?
-                                      totalLength - i : UTF8_TEXT_EVENT_MAX_COUNT;
+            // HACK: This is a workaround for the fact that GFE doesn't appear to synchronize keyboard
+            // and UTF-8 text events with each other. We need to make sure any previous keyboard events
+            // have been processed prior to sending these UTF-8 events to avoid interference between
+            // the two (especially with modifier keys).
+            while (!PltIsThreadInterrupted(&inputSendThread) && isControlDataInTransit()) {
+                PltSleepMs(10);
+            }
 
-                splitPacket.packetLength = sizeof(uint32_t) + sizeof(uint32_t) + copyLength;
-                splitPacket.packet.unicode.header.size = BE32(splitPacket.packetLength - sizeof(uint32_t));
+            // Finally, sleep an additional 50 ms to allow the events to be processed by Windows
+            PltSleepMs(50);
+
+            // We send each Unicode code point individually. This way we can always ensure they will
+            // never straddle a packet boundary (which will cause a parsing error on the host).
+            while (i < totalLength) {
+                uint32_t codePointLength;
+                uint8_t firstByte = (uint8_t)holder->packet.unicode.text[i];
+                if ((firstByte & 0x80) == 0x00) {
+                    // 1 byte code point
+                    codePointLength = 1;
+                }
+                else if ((firstByte & 0xE0) == 0xC0) {
+                    // 2 byte code point
+                    codePointLength = 2;
+                }
+                else if ((firstByte & 0xF0) == 0xE0) {
+                    // 3 byte code point
+                    codePointLength = 3;
+                }
+                else if ((firstByte & 0xF8) == 0xF0) {
+                    // 4 byte code point
+                    codePointLength = 4;
+                }
+                else {
+                    Limelog("Invalid unicode code point starting byte: %02x\n", firstByte);
+                    break;
+                }
+
+                splitPacket.packet.unicode.header.size = BE32(sizeof(uint32_t) + codePointLength);
                 splitPacket.packet.unicode.header.magic = LE32(UTF8_TEXT_EVENT_MAGIC);
-                memcpy(splitPacket.packet.unicode.text, &holder->packet.unicode.text[i], copyLength);
+                memcpy(splitPacket.packet.unicode.text, &holder->packet.unicode.text[i], codePointLength);
 
                 // Encrypt and send the split packet
                 if (!sendInputPacket(&splitPacket)) {
@@ -385,7 +444,7 @@ static void inputSendThreadProc(void* context) {
                     return;
                 }
 
-                i += copyLength;
+                i += codePointLength;
             }
 
             freePacketHolder(holder);
@@ -409,7 +468,7 @@ static int sendEnableHaptics(void) {
 
     // Avoid sending this on earlier server versions, since they may terminate
     // the connection upon receiving an unexpected packet.
-    if (AppVersionQuad[0] < 7 || (AppVersionQuad[0] == 7 && AppVersionQuad[1] < 1)) {
+    if (!APP_VERSION_AT_LEAST(7, 1, 0)) {
         return 0;
     }
 
@@ -418,8 +477,7 @@ static int sendEnableHaptics(void) {
         return -1;
     }
 
-    holder->packetLength = sizeof(NV_HAPTICS_PACKET);
-    holder->packet.haptics.header.size = BE32(holder->packetLength - sizeof(uint32_t));
+    holder->packet.haptics.header.size = BE32(sizeof(NV_HAPTICS_PACKET) - sizeof(uint32_t));
     holder->packet.haptics.header.magic = LE32(ENABLE_HAPTICS_MAGIC);
     holder->packet.haptics.enable = LE16(1);
 
@@ -508,8 +566,7 @@ int LiSendMouseMoveEvent(short deltaX, short deltaY) {
         return -1;
     }
 
-    holder->packetLength = sizeof(NV_REL_MOUSE_MOVE_PACKET);
-    holder->packet.mouseMoveRel.header.size = BE32(holder->packetLength - sizeof(uint32_t));
+    holder->packet.mouseMoveRel.header.size = BE32(sizeof(NV_REL_MOUSE_MOVE_PACKET) - sizeof(uint32_t));
     if (AppVersionQuad[0] >= 5) {
         holder->packet.mouseMoveRel.header.magic = LE32(MOUSE_MOVE_REL_MAGIC_GEN5);
     }
@@ -543,8 +600,7 @@ int LiSendMousePositionEvent(short x, short y, short referenceWidth, short refer
         return -1;
     }
 
-    holder->packetLength = sizeof(NV_ABS_MOUSE_MOVE_PACKET);
-    holder->packet.mouseMoveAbs.header.size = BE32(holder->packetLength - sizeof(uint32_t));
+    holder->packet.mouseMoveAbs.header.size = BE32(sizeof(NV_ABS_MOUSE_MOVE_PACKET) - sizeof(uint32_t));
     holder->packet.mouseMoveAbs.header.magic = LE32(MOUSE_MOVE_ABS_MAGIC);
     holder->packet.mouseMoveAbs.x = BE16(x);
     holder->packet.mouseMoveAbs.y = BE16(y);
@@ -565,7 +621,25 @@ int LiSendMousePositionEvent(short x, short y, short referenceWidth, short refer
         freePacketHolder(holder);
     }
 
+    // This is not thread safe, but it's not a big deal because callers that want to
+    // use LiSendRelativeMotionAsMousePositionEvent() must not mix these function
+    // without synchronization (otherwise the state of the cursor on the host is
+    // undefined anyway).
+    absCurrentPosX = CLAMP(x, 0, referenceWidth - 1) / (float)(referenceWidth - 1);
+    absCurrentPosY = CLAMP(y, 0, referenceHeight - 1) / (float)(referenceHeight - 1);
+
     return err;
+}
+
+// Send a relative motion event using absolute position to the streaming machine
+int LiSendMouseMoveAsMousePositionEvent(short deltaX, short deltaY, short referenceWidth, short referenceHeight) {
+    // Convert the current position to be relative to the provided reference dimensions
+    short oldPositionX = (short)(absCurrentPosX * referenceWidth);
+    short oldPositionY = (short)(absCurrentPosY * referenceHeight);
+
+    return LiSendMousePositionEvent(CLAMP(oldPositionX + deltaX, 0, referenceWidth),
+                                    CLAMP(oldPositionY + deltaY, 0, referenceHeight),
+                                    referenceWidth, referenceHeight);
 }
 
 // Send a mouse button event to the streaming machine
@@ -582,8 +656,7 @@ int LiSendMouseButtonEvent(char action, int button) {
         return -1;
     }
 
-    holder->packetLength = sizeof(NV_MOUSE_BUTTON_PACKET);
-    holder->packet.mouseButton.header.size = BE32(holder->packetLength - sizeof(uint32_t));
+    holder->packet.mouseButton.header.size = BE32(sizeof(NV_MOUSE_BUTTON_PACKET) - sizeof(uint32_t));
     holder->packet.mouseButton.header.magic = (uint8_t)action;
     if (AppVersionQuad[0] >= 5) {
         holder->packet.mouseButton.header.magic++;
@@ -602,7 +675,7 @@ int LiSendMouseButtonEvent(char action, int button) {
 }
 
 // Send a key press event to the streaming machine
-int LiSendKeyboardEvent(short keyCode, char keyAction, char modifiers) {
+int LiSendKeyboardEvent2(short keyCode, char keyAction, char modifiers, char flags) {
     PPACKET_HOLDER holder;
     int err;
 
@@ -657,10 +730,9 @@ int LiSendKeyboardEvent(short keyCode, char keyAction, char modifiers) {
         break;
     }
 
-    holder->packetLength = sizeof(NV_KEYBOARD_PACKET);
-    holder->packet.keyboard.header.size = BE32(holder->packetLength - sizeof(uint32_t));
+    holder->packet.keyboard.header.size = BE32(sizeof(NV_KEYBOARD_PACKET) - sizeof(uint32_t));
     holder->packet.keyboard.header.magic = LE32((uint32_t)keyAction);
-    holder->packet.keyboard.zero1 = 0;
+    holder->packet.keyboard.flags = IS_SUNSHINE() ? flags : 0;
     holder->packet.keyboard.keyCode = LE16(keyCode);
     holder->packet.keyboard.modifiers = modifiers;
     holder->packet.keyboard.zero2 = 0;
@@ -675,6 +747,10 @@ int LiSendKeyboardEvent(short keyCode, char keyAction, char modifiers) {
     return err;
 }
 
+int LiSendKeyboardEvent(short keyCode, char keyAction, char modifiers) {
+    return LiSendKeyboardEvent2(keyCode, keyAction, modifiers, 0);
+}
+
 int LiSendUtf8TextEvent(const char *text, unsigned int length) {
     PPACKET_HOLDER holder;
     int err;
@@ -687,10 +763,8 @@ int LiSendUtf8TextEvent(const char *text, unsigned int length) {
     if (holder == NULL) {
         return -1;
     }
-    // Size + magic + string length
-    holder->packetLength = sizeof(uint32_t) + sizeof(uint32_t) + length;
     // Magic + string length
-    holder->packet.unicode.header.size = BE32(holder->packetLength - sizeof(uint32_t));
+    holder->packet.unicode.header.size = BE32(sizeof(uint32_t) + length);
     holder->packet.unicode.header.magic = LE32(UTF8_TEXT_EVENT_MAGIC);
     memcpy(holder->packet.unicode.text, text, length);
 
@@ -723,8 +797,7 @@ static int sendControllerEventInternal(short controllerNumber, short activeGamep
     if (AppVersionQuad[0] == 3) {
         // Generation 3 servers don't support multiple controllers so we send
         // the legacy packet
-        holder->packetLength = sizeof(NV_CONTROLLER_PACKET);
-        holder->packet.controller.header.size = BE32(holder->packetLength - sizeof(uint32_t));
+        holder->packet.controller.header.size = BE32(sizeof(NV_CONTROLLER_PACKET) - sizeof(uint32_t));
         holder->packet.controller.header.magic = LE32(CONTROLLER_MAGIC);
         holder->packet.controller.headerB = LE16(C_HEADER_B);
         holder->packet.controller.buttonFlags = LE16(buttonFlags);
@@ -739,8 +812,7 @@ static int sendControllerEventInternal(short controllerNumber, short activeGamep
     }
     else {
         // Generation 4+ servers support passing the controller number
-        holder->packetLength = sizeof(NV_MULTI_CONTROLLER_PACKET);
-        holder->packet.multiController.header.size = BE32(holder->packetLength - sizeof(uint32_t));
+        holder->packet.multiController.header.size = BE32(sizeof(NV_MULTI_CONTROLLER_PACKET) - sizeof(uint32_t));
         // On Gen 5 servers, the header code is decremented by one
         if (AppVersionQuad[0] >= 5) {
             holder->packet.multiController.header.magic = LE32(MULTI_CONTROLLER_MAGIC_GEN5);
@@ -804,22 +876,113 @@ int LiSendHighResScrollEvent(short scrollAmount) {
         return 0;
     }
 
+    // Newer version of GFE that use virtual HID devices have a bug that requires
+    // the scroll events to be batched to WHEEL_DELTA. Due to the their HID report
+    // descriptor, they don't actually support smooth scrolling. _Any_ scroll gets
+    // converted into a full WHEEL_DELTA scroll, even if the actual delta is tiny.
+    // Similarly, large scrolls are capped at +/- WHEEL_DELTA too so we'll need to
+    // split those up too.
+    if (needsBatchedScroll) {
+        if ((batchedScrollDelta < 0 && scrollAmount > 0) ||
+            (batchedScrollDelta > 0 && scrollAmount < 0)) {
+            // Reset the accumulated scroll delta when the direction changes
+            // FIXME: Maybe reset accumulated delta based on time too?
+            batchedScrollDelta = 0;
+        }
+
+        batchedScrollDelta += scrollAmount;
+
+        while (abs(batchedScrollDelta) >= LI_WHEEL_DELTA) {
+            scrollAmount = batchedScrollDelta > 0 ? LI_WHEEL_DELTA : -LI_WHEEL_DELTA;
+
+            holder = allocatePacketHolder(0);
+            if (holder == NULL) {
+                return -1;
+            }
+
+            holder->packet.scroll.header.size = BE32(sizeof(NV_SCROLL_PACKET) - sizeof(uint32_t));
+            if (AppVersionQuad[0] >= 5) {
+                holder->packet.scroll.header.magic = LE32(SCROLL_MAGIC_GEN5);
+            }
+            else {
+                holder->packet.scroll.header.magic = LE32(SCROLL_MAGIC);
+            }
+            holder->packet.scroll.scrollAmt1 = BE16(scrollAmount);
+            holder->packet.scroll.scrollAmt2 = holder->packet.scroll.scrollAmt1;
+            holder->packet.scroll.zero3 = 0;
+
+            err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
+            if (err != LBQ_SUCCESS) {
+                LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
+                Limelog("Input queue reached maximum size limit\n");
+                freePacketHolder(holder);
+                return err;
+            }
+
+            batchedScrollDelta -= scrollAmount;
+        }
+
+        err = 0;
+    }
+    else {
+        holder = allocatePacketHolder(0);
+        if (holder == NULL) {
+            return -1;
+        }
+
+        holder->packet.scroll.header.size = BE32(sizeof(NV_SCROLL_PACKET) - sizeof(uint32_t));
+        if (AppVersionQuad[0] >= 5) {
+            holder->packet.scroll.header.magic = LE32(SCROLL_MAGIC_GEN5);
+        }
+        else {
+            holder->packet.scroll.header.magic = LE32(SCROLL_MAGIC);
+        }
+        holder->packet.scroll.scrollAmt1 = BE16(scrollAmount);
+        holder->packet.scroll.scrollAmt2 = holder->packet.scroll.scrollAmt1;
+        holder->packet.scroll.zero3 = 0;
+
+        err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
+        if (err != LBQ_SUCCESS) {
+            LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
+            Limelog("Input queue reached maximum size limit\n");
+            freePacketHolder(holder);
+        }
+    }
+
+    return err;
+}
+
+// Send a scroll event to the streaming machine
+int LiSendScrollEvent(signed char scrollClicks) {
+    return LiSendHighResScrollEvent(scrollClicks * LI_WHEEL_DELTA);
+}
+
+// Send a high resolution horizontal scroll event
+int LiSendHighResHScrollEvent(short scrollAmount) {
+    PPACKET_HOLDER holder;
+    int err;
+
+    if (!initialized) {
+        return -2;
+    }
+
+    // This is a protocol extension only supported with Sunshine
+    if (!IS_SUNSHINE()) {
+        return -3;
+    }
+
+    if (scrollAmount == 0) {
+        return 0;
+    }
+
     holder = allocatePacketHolder(0);
     if (holder == NULL) {
         return -1;
     }
 
-    holder->packetLength = sizeof(NV_SCROLL_PACKET);
-    holder->packet.scroll.header.size = BE32(holder->packetLength - sizeof(uint32_t));
-    if (AppVersionQuad[0] >= 5) {
-        holder->packet.scroll.header.magic = LE32(SCROLL_MAGIC_GEN5);
-    }
-    else {
-        holder->packet.scroll.header.magic = LE32(SCROLL_MAGIC);
-    }
-    holder->packet.scroll.scrollAmt1 = BE16(scrollAmount);
-    holder->packet.scroll.scrollAmt2 = holder->packet.scroll.scrollAmt1;
-    holder->packet.scroll.zero3 = 0;
+    holder->packet.hscroll.header.size = BE32(sizeof(SS_HSCROLL_PACKET) - sizeof(uint32_t));
+    holder->packet.hscroll.header.magic = LE32(SS_HSCROLL_MAGIC);
+    holder->packet.hscroll.scrollAmount = BE16(scrollAmount);
 
     err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
     if (err != LBQ_SUCCESS) {
@@ -831,7 +994,6 @@ int LiSendHighResScrollEvent(short scrollAmount) {
     return err;
 }
 
-// Send a scroll event to the streaming machine
-int LiSendScrollEvent(signed char scrollClicks) {
-    return LiSendHighResScrollEvent(scrollClicks * 120);
+int LiSendHScrollEvent(signed char scrollClicks) {
+    return LiSendHighResHScrollEvent(scrollClicks * LI_WHEEL_DELTA);
 }

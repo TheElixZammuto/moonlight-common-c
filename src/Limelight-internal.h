@@ -31,6 +31,7 @@ extern OPUS_MULTISTREAM_CONFIGURATION HighQualityOpusConfig;
 extern int OriginalVideoBitrate;
 extern int AudioPacketDuration;
 extern bool AudioEncryptionEnabled;
+extern bool ReferenceFrameInvalidationSupported;
 
 extern uint16_t RtspPortNumber;
 extern uint16_t ControlPortNumber;
@@ -53,6 +54,8 @@ extern uint16_t VideoPortNumber;
     ((AppVersionQuad[0] > (a)) ||                                                           \
      (AppVersionQuad[0] == (a) && AppVersionQuad[1] > (b)) ||                               \
      (AppVersionQuad[0] == (a) && AppVersionQuad[1] == (b) && AppVersionQuad[2] >= (c)))
+
+#define IS_SUNSHINE() (AppVersionQuad[3] < 0)
 
 #define UDP_RECV_POLL_TIMEOUT_MS 100
 
@@ -83,20 +86,21 @@ int initializeControlStream(void);
 int startControlStream(void);
 int stopControlStream(void);
 void destroyControlStream(void);
-void requestIdrOnDemand(void);
 void connectionDetectedFrameLoss(int startFrame, int endFrame);
 void connectionReceivedCompleteFrame(int frameIndex);
 void connectionSawFrame(int frameIndex);
 void connectionLostPackets(int lastReceivedPacket, int nextReceivedPacket);
 int sendInputPacketOnControlStream(unsigned char* data, int length);
+bool isControlDataInTransit(void);
 
-int performRtspHandshake(void);
+int performRtspHandshake(PSERVER_INFORMATION serverInfo);
 
 void initializeVideoDepacketizer(int pktSize);
 void destroyVideoDepacketizer(void);
 void queueRtpPacket(PRTPV_QUEUE_ENTRY queueEntry);
 void stopVideoDepacketizer(void);
 void requestDecoderRefresh(void);
+void notifyFrameLost(unsigned int frameNumber, bool speculative);
 
 void initializeVideoStream(void);
 void destroyVideoStream(void);

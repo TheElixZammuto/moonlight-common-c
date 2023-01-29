@@ -5,7 +5,11 @@
 #define RCV_BUFFER_SIZE_MIN  32767
 #define RCV_BUFFER_SIZE_STEP 16384
 
+#if defined(__vita__)
+#define TCPv4_MSS 512
+#else
 #define TCPv4_MSS 536
+#endif
 #define TCPv6_MSS 1220
 
 #if defined(LC_WINDOWS)
@@ -23,6 +27,10 @@ DWORD (WINAPI *pfnWlanCloseHandle)(HANDLE hClientHandle, PVOID pReserved);
 DWORD (WINAPI *pfnWlanEnumInterfaces)(HANDLE hClientHandle, PVOID pReserved, PWLAN_INTERFACE_INFO_LIST *ppInterfaceList);
 VOID (WINAPI *pfnWlanFreeMemory)(PVOID pMemory);
 DWORD (WINAPI *pfnWlanSetInterface)(HANDLE hClientHandle, CONST GUID *pInterfaceGuid, WLAN_INTF_OPCODE OpCode, DWORD dwDataSize, CONST PVOID pData, PVOID pReserved);
+#endif
+
+#ifndef WLAN_API_MAKE_VERSION
+#define WLAN_API_MAKE_VERSION(_major, _minor)   (((DWORD)(_minor)) << 16 | (_major))
 #endif
 
 #endif
@@ -80,7 +88,7 @@ int setNonFatalRecvTimeoutMs(SOCKET s, int timeoutMs) {
 }
 
 int pollSockets(struct pollfd* pollFds, int pollFdsCount, int timeoutMs) {
-#if defined(LC_WINDOWS) || defined(__vita__)
+#if defined(LC_WINDOWS)
     // We could have used WSAPoll() but it has some nasty bugs
     // https://daniel.haxx.se/blog/2012/10/10/wsapoll-is-broken/
     //
@@ -105,19 +113,10 @@ int pollSockets(struct pollfd* pollFds, int pollFdsCount, int timeoutMs) {
         if (pollFds[i].events & POLLOUT) {
             FD_SET(pollFds[i].fd, &writeFds);
 
-#ifdef LC_WINDOWS
             // Windows signals failed connections as an exception,
             // while Linux signals them as writeable.
             FD_SET(pollFds[i].fd, &exceptFds);
-#endif
         }
-
-#ifndef LC_WINDOWS
-        // nfds is unused on Windows
-        if (pollFds[i].fd >= nfds) {
-            nfds = pollFds[i].fd + 1;
-        }
-#endif
     }
 
     tv.tv_sec = timeoutMs / 1000;
@@ -304,7 +303,11 @@ int setSocketNonBlocking(SOCKET s, bool enabled) {
 #elif defined(O_NONBLOCK)
     return fcntl(s, F_SETFL, (enabled ? O_NONBLOCK : 0) | (fcntl(s, F_GETFL) & ~O_NONBLOCK));
 #elif defined(FIONBIO)
+#ifdef LC_WINDOWS
+    u_long val = enabled ? 1 : 0;
+#else
     int val = enabled ? 1 : 0;
+#endif
     return ioctlsocket(s, FIONBIO, &val);
 #else
 #error Please define your platform non-blocking sockets API!

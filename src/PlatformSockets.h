@@ -7,7 +7,11 @@
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #include <wlanapi.h>
+#ifndef __MINGW32__
 #include <timeapi.h>
+#else
+#include <mmsystem.h>
+#endif
 #define SetLastSocketError(x) WSASetLastError(x)
 #define LastSocketError() WSAGetLastError()
 
@@ -22,6 +26,13 @@
 #undef EINTR
 #endif
 #define EINTR WSAEINTR
+
+#ifdef __MINGW32__
+#undef EWOULDBLOCK
+#undef EINPROGRESS
+#undef ETIMEDOUT
+#undef ECONNREFUSED
+#endif
 
 #define EWOULDBLOCK WSAEWOULDBLOCK
 #define EINPROGRESS WSAEINPROGRESS
@@ -42,24 +53,7 @@ typedef int SOCKADDR_LEN;
 #include <netdb.h>
 #include <errno.h>
 #include <signal.h>
-#if defined(__vita__)
-#define POLLIN      0x0001
-#define POLLPRI     0x0002
-#define POLLOUT     0x0004
-#define POLLERR     0x0008
-#define POLLRDNORM  0x0040
-#define POLLWRNORM  POLLOUT
-#define POLLRDBAND  0x0080
-#define POLLWRBAND  0x0100
-
-struct pollfd {
-    int fd;
-    short events;
-    short revents;
-};
-#else
 #include <poll.h>
-#endif
 
 #define ioctlsocket ioctl
 #define LastSocketError() errno

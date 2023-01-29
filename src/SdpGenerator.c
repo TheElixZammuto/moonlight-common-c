@@ -175,6 +175,13 @@ static int addGen5Options(PSDP_OPTION* head) {
         // above the set value (even going as high as 200% FEC to generate 2 FEC shards from a
         // 1 data shard frame).
         err |= addAttributeString(head, "x-nv-vqos[0].fec.minRequiredFecPackets", "2");
+
+        // BLL-FEC appears to adjust dynamically based on the loss rate and instantaneous bitrate
+        // of each frame, however we can't dynamically control it from our side yet. As a result,
+        // the effective FEC amount is significantly lower (single digit percentages for many
+        // large frames) and the result is worse performance during packet loss. Disabling BLL-FEC
+        // results in GFE 3.26 falling back to the legacy FEC method as we would like.
+        err |= addAttributeString(head, "x-nv-vqos[0].bllFec.enable", "0");
     }
     else {
         // We want to use the new ENet connections for control and input
@@ -190,8 +197,20 @@ static int addGen5Options(PSDP_OPTION* head) {
         }
     }
     
-    // Disable dynamic resolution switching
-    err |= addAttributeString(head, "x-nv-vqos[0].drc.enable", "0");
+    if (APP_VERSION_AT_LEAST(7, 1, 446) && (StreamConfig.width < 720 || StreamConfig.height < 540)) {
+        // We enable DRC with a static DRC table for very low resoutions on GFE 3.26 to work around
+        // a bug that causes nvstreamer.exe to crash due to failing to populate a list of valid resolutions.
+        //
+        // Despite the fact that the DRC table doesn't include our target streaming resolution, we still
+        // seem to stream at the target resolution, presumably because we don't send control data to tell
+        // the host otherwise.
+        err |= addAttributeString(head, "x-nv-vqos[0].drc.enable", "1");
+        err |= addAttributeString(head, "x-nv-vqos[0].drc.tableType", "2");
+    }
+    else {
+        // Disable dynamic resolution switching
+        err |= addAttributeString(head, "x-nv-vqos[0].drc.enable", "0");
+    }
 
     // Recovery mode can cause the FEC percentage to change mid-frame, which
     // breaks many assumptions in RTP FEC queue.
@@ -342,9 +361,7 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
                 }
             }
 
-            if (AppVersionQuad[0] < 7 ||
-                (AppVersionQuad[0] == 7 && AppVersionQuad[1] < 1) ||
-                (AppVersionQuad[0] == 7 && AppVersionQuad[1] == 1 && AppVersionQuad[2] < 408)) {
+            if (!APP_VERSION_AT_LEAST(7, 1, 408)) {
                 // This disables split frame encode on GFE 3.10 which seems to produce broken
                 // HEVC output at 1080p60 (full of artifacts even on the SHIELD itself, go figure).
                 // It now appears to work fine on GFE 3.14.1.

@@ -24,6 +24,7 @@ OPUS_MULTISTREAM_CONFIGURATION HighQualityOpusConfig;
 int OriginalVideoBitrate;
 int AudioPacketDuration;
 bool AudioEncryptionEnabled;
+bool ReferenceFrameInvalidationSupported;
 uint16_t RtspPortNumber;
 uint16_t ControlPortNumber;
 uint16_t AudioPortNumber;
@@ -398,7 +399,7 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
 
     Limelog("Starting RTSP handshake...");
     ListenerCallbacks.stageStarting(STAGE_RTSP_HANDSHAKE);
-    err = performRtspHandshake();
+    err = performRtspHandshake(serverInfo);
     if (err != 0) {
         Limelog("failed: %d\n", err);
         ListenerCallbacks.stageFailed(STAGE_RTSP_HANDSHAKE, err);

@@ -5,7 +5,7 @@
 typedef struct _NV_INPUT_HEADER {
     uint32_t size; // Size of packet (excluding this field) - Big Endian
     uint32_t magic; // Packet type - Little Endian
-} NV_INPUT_HEADER, PNV_INPUT_HEADER;
+} NV_INPUT_HEADER, *PNV_INPUT_HEADER;
 
 #define ENABLE_HAPTICS_MAGIC 0x0000000D
 typedef struct _NV_HAPTICS_PACKET {
@@ -13,9 +13,11 @@ typedef struct _NV_HAPTICS_PACKET {
     uint16_t enable;
 } NV_HAPTICS_PACKET, *PNV_HAPTICS_PACKET;
 
+#define KEY_DOWN_EVENT_MAGIC 0x00000003
+#define KEY_UP_EVENT_MAGIC 0x00000004
 typedef struct _NV_KEYBOARD_PACKET {
     NV_INPUT_HEADER header;
-    char zero1;
+    char flags; // Sunshine extension (always 0 for GFE)
     short keyCode;
     char modifiers;
     short zero2;
@@ -51,7 +53,8 @@ typedef struct _NV_ABS_MOUSE_MOVE_PACKET {
     short height;
 } NV_ABS_MOUSE_MOVE_PACKET, *PNV_ABS_MOUSE_MOVE_PACKET;
 
-#define MOUSE_BUTTON_MAGIC 0x00000005
+#define MOUSE_BUTTON_DOWN_EVENT_MAGIC_GEN5 0x00000008
+#define MOUSE_BUTTON_UP_EVENT_MAGIC_GEN5 0x00000009
 typedef struct _NV_MOUSE_BUTTON_PACKET {
     NV_INPUT_HEADER header;
     uint8_t button;
@@ -106,5 +109,11 @@ typedef struct _NV_SCROLL_PACKET {
     short scrollAmt2;
     short zero3;
 } NV_SCROLL_PACKET, *PNV_SCROLL_PACKET;
+
+#define SS_HSCROLL_MAGIC 0x55000001
+typedef struct _SS_HSCROLL_PACKET {
+    NV_INPUT_HEADER header;
+    short scrollAmount;
+} SS_HSCROLL_PACKET, *PSS_HSCROLL_PACKET;
 
 #pragma pack(pop)

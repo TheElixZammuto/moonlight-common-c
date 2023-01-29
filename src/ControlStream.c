@@ -49,6 +49,8 @@ static int lastSeenFrame;
 static bool stopping;
 static bool disconnectPending;
 static bool encryptedControlStream;
+static bool hdrEnabled;
+static SS_HDR_METADATA hdrMetadata;
 
 static int intervalGoodFrameCount;
 static int intervalTotalFrameCount;
@@ -76,6 +78,7 @@ static PPLT_CRYPTO_CONTEXT decryptionCtx;
 #define IDX_INPUT_DATA 5
 #define IDX_RUMBLE_DATA 6
 #define IDX_TERMINATION 7
+#define IDX_HDR_INFO 8
 
 #define CONTROL_STREAM_TIMEOUT_SEC 10
 #define CONTROL_STREAM_LINGER_TIMEOUT_SEC 2
@@ -89,6 +92,7 @@ static const short packetTypesGen3[] = {
     -1,     // Input data (unused)
     -1,     // Rumble data (unused)
     -1,     // Termination (unused)
+    -1,     // HDR mode (unused)
 };
 static const short packetTypesGen4[] = {
     0x0606, // Request IDR frame
@@ -99,6 +103,7 @@ static const short packetTypesGen4[] = {
     -1,     // Input data (unused)
     -1,     // Rumble data (unused)
     -1,     // Termination (unused)
+    -1,     // HDR mode (unused)
 };
 static const short packetTypesGen5[] = {
     0x0305, // Start A
@@ -109,6 +114,7 @@ static const short packetTypesGen5[] = {
     0x0207, // Input data
     -1,     // Rumble data (unused)
     -1,     // Termination (unused)
+    -1,     // HDR mode (unknown)
 };
 static const short packetTypesGen7[] = {
     0x0305, // Start A
@@ -119,6 +125,7 @@ static const short packetTypesGen7[] = {
     0x0206, // Input data
     0x010b, // Rumble data
     0x0100, // Termination
+    0x010e, // HDR mode
 };
 static const short packetTypesGen7Enc[] = {
     0x0302, // Request IDR frame
@@ -129,6 +136,7 @@ static const short packetTypesGen7Enc[] = {
     0x0206, // Input data
     0x010b, // Rumble data
     0x0109, // Termination (extended)
+    0x010e, // HDR mode
 };
 
 static const char requestIdrFrameGen3[] = { 0, 0 };
@@ -267,6 +275,8 @@ int initializeControlStream(void) {
     usePeriodicPing = APP_VERSION_AT_LEAST(7, 1, 415);
     encryptionCtx = PltCreateCryptoContext();
     decryptionCtx = PltCreateCryptoContext();
+    hdrEnabled = false;
+    memset(&hdrMetadata, 0, sizeof(hdrMetadata));
 
     return 0;
 }
@@ -304,20 +314,20 @@ void queueFrameInvalidationTuple(int startFrame, int endFrame) {
                 // Too many invalidation tuples, so we need an IDR frame now
                 Limelog("RFI range list reached maximum size limit\n");
                 free(qfit);
-                requestIdrOnDemand();
+                LiRequestIdrFrame();
             }
         }
         else {
-            requestIdrOnDemand();
+            LiRequestIdrFrame();
         }
     }
     else {
-        requestIdrOnDemand();
+        LiRequestIdrFrame();
     }
 }
 
 // Request an IDR frame on demand by the decoder
-void requestIdrOnDemand(void) {
+void LiRequestIdrFrame(void) {
     // Any reference frame invalidation requests should be dropped now.
     // We require a full IDR frame to recover.
     freeFrameInvalidationList(LbqFlushQueueItems(&invalidReferenceFrameTuples));
@@ -799,6 +809,34 @@ static void controlReceiveThreadFunc(void* context) {
 
                 ListenerCallbacks.rumble(controllerNumber, lowFreqRumble, highFreqRumble);
             }
+            else if (ctlHdr->type == packetTypes[IDX_HDR_INFO]) {
+                BYTE_BUFFER bb;
+                uint8_t enableByte;
+
+                BbInitializeWrappedBuffer(&bb, (char*)ctlHdr, sizeof(*ctlHdr), packetLength - sizeof(*ctlHdr), BYTE_ORDER_LITTLE);
+
+                BbGet8(&bb, &enableByte);
+                if (IS_SUNSHINE()) {
+                    // Zero the metadata buffer to properly handle older servers if we have to add new fields
+                    memset(&hdrMetadata, 0, sizeof(hdrMetadata));
+
+                    // Sunshine sends HDR metadata in this message too
+                    for (int i = 0; i < 3; i++) {
+                        BbGet16(&bb, &hdrMetadata.displayPrimaries[i].x);
+                        BbGet16(&bb, &hdrMetadata.displayPrimaries[i].y);
+                    }
+                    BbGet16(&bb, &hdrMetadata.whitePoint.x);
+                    BbGet16(&bb, &hdrMetadata.whitePoint.y);
+                    BbGet16(&bb, &hdrMetadata.maxDisplayLuminance);
+                    BbGet16(&bb, &hdrMetadata.minDisplayLuminance);
+                    BbGet16(&bb, &hdrMetadata.maxContentLightLevel);
+                    BbGet16(&bb, &hdrMetadata.maxFrameAverageLightLevel);
+                    BbGet16(&bb, &hdrMetadata.maxFullFrameLuminance);
+                }
+
+                hdrEnabled = (enableByte != 0);
+                ListenerCallbacks.setHdrMode(hdrEnabled);
+            }
             else if (ctlHdr->type == packetTypes[IDX_TERMINATION]) {
                 BYTE_BUFFER bb;
 
@@ -812,8 +850,15 @@ static void controlReceiveThreadFunc(void* context) {
 
                     Limelog("Server notified termination reason: 0x%08x\n", terminationErrorCode);
 
-                    // NVST_DISCONN_SERVER_TERMINATED_CLOSED is the expected graceful termination error
-                    if (terminationErrorCode == 0x80030023) {
+                    // Normalize the termination error codes for specific values we recognize
+                    switch (terminationErrorCode) {
+                    case 0x800e9403: // NVST_DISCONN_SERVER_VIDEO_ENCODER_CONVERT_INPUT_FRAME_FAILED
+                        terminationErrorCode = ML_ERROR_FRAME_CONVERSION;
+                        break;
+                    case 0x800e9302: // NVST_DISCONN_SERVER_VFP_PROTECTED_CONTENT
+                        terminationErrorCode = ML_ERROR_PROTECTED_CONTENT;
+                        break;
+                    case 0x80030023: // NVST_DISCONN_SERVER_TERMINATED_CLOSED
                         if (lastSeenFrame != 0) {
                             // Pass error code 0 to notify the client that this was not an error
                             terminationErrorCode = ML_ERROR_GRACEFUL_TERMINATION;
@@ -823,10 +868,9 @@ static void controlReceiveThreadFunc(void* context) {
                             // NvStreamer to terminate prior to sending any frames.
                             terminationErrorCode = ML_ERROR_UNEXPECTED_EARLY_TERMINATION;
                         }
-                    }
-                    // NVST_DISCONN_SERVER_VFP_PROTECTED_CONTENT means it failed due to protected content on screen
-                    else if (terminationErrorCode == 0x800e9302) {
-                        terminationErrorCode = ML_ERROR_PROTECTED_CONTENT;
+                        break;
+                    default:
+                        break;
                     }
                 }
                 else {
@@ -1116,6 +1160,20 @@ int sendInputPacketOnControlStream(unsigned char* data, int length) {
     return 0;
 }
 
+bool isControlDataInTransit(void) {
+    bool ret = false;
+
+    PltLockMutex(&enetMutex);
+    if (peer != NULL && peer->state == ENET_PEER_STATE_CONNECTED) {
+        if (peer->reliableDataInTransit != 0) {
+            ret = true;
+        }
+    }
+    PltUnlockMutex(&enetMutex);
+
+    return ret;
+}
+
 bool LiGetEstimatedRttInfo(uint32_t* estimatedRtt, uint32_t* estimatedRttVariance) {
     bool ret = false;
 
@@ -1168,15 +1226,35 @@ int startControlStream(void) {
         }
 
         // Wait for the connect to complete
-        if (serviceEnetHost(client, &event, CONTROL_STREAM_TIMEOUT_SEC * 1000) <= 0 ||
-            event.type != ENET_EVENT_TYPE_CONNECT) {
-            Limelog("Failed to connect to UDP port %u\n", ControlPortNumber);
+        err = serviceEnetHost(client, &event, CONTROL_STREAM_TIMEOUT_SEC * 1000);
+        if (err <= 0 || event.type != ENET_EVENT_TYPE_CONNECT) {
+            if (err < 0) {
+                Limelog("Failed to establish ENet connection on UDP port %u: error %d\n", ControlPortNumber, LastSocketFail());
+            }
+            else if (err == 0) {
+                Limelog("Failed to establish ENet connection on UDP port %u: timed out\n", ControlPortNumber);
+            }
+            else {
+                Limelog("Failed to establish ENet connection on UDP port %u: unexpected event %d (error: %d)\n", ControlPortNumber, (int)event.type, LastSocketError());
+            }
+
             stopping = true;
             enet_peer_reset(peer);
             peer = NULL;
             enet_host_destroy(client);
             client = NULL;
-            return ETIMEDOUT;
+
+            if (err == 0) {
+                return ETIMEDOUT;
+            }
+            else if (err > 0 && event.type != ENET_EVENT_TYPE_CONNECT && LastSocketError() == 0) {
+                // If we got an unexpected event type and have no other error to return, return the event type
+                LC_ASSERT(event.type != ENET_EVENT_TYPE_NONE);
+                return event.type != ENET_EVENT_TYPE_NONE ? (int)event.type : LastSocketFail();
+            }
+            else {
+                return LastSocketFail();
+            }
         }
 
         // Ensure the connect verify ACK is sent immediately
@@ -1381,4 +1459,17 @@ int startControlStream(void) {
     }
 
     return 0;
+}
+
+bool LiGetCurrentHostDisplayHdrMode(void) {
+    return hdrEnabled;
+}
+
+bool LiGetHdrMetadata(PSS_HDR_METADATA metadata) {
+    if (!IS_SUNSHINE() || !hdrEnabled) {
+        return false;
+    }
+
+    *metadata = hdrMetadata;
+    return true;
 }

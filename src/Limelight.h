@@ -70,7 +70,9 @@ typedef struct _STREAM_CONFIGURATION {
     // This should only be set if:
     // 1) The client decoder supports HEVC Main10 profile (supportsHevc must be set too)
     // 2) The server has support for HDR as indicated by ServerCodecModeSupport in /serverinfo
-    // 3) The app supports HDR as indicated by IsHdrSupported in /applist
+    //
+    // See ConnListenerSetHdrMode() for a callback to indicate when to set
+    // the client display into HDR mode.
     bool enableHdr;
 
     // Specifies the percentage that the specified bitrate will be adjusted
@@ -212,8 +214,9 @@ typedef struct _DECODE_UNIT {
 #define VIDEO_FORMAT_H265_MAIN10 0x0200
 
 // Masks for clients to use to match video codecs without profile-specific details.
-#define VIDEO_FORMAT_MASK_H264 0x00FF
-#define VIDEO_FORMAT_MASK_H265 0xFF00
+#define VIDEO_FORMAT_MASK_H264  0x00FF
+#define VIDEO_FORMAT_MASK_H265  0xFF00
+#define VIDEO_FORMAT_MASK_10BIT 0x0200
 
 // If set in the renderer capabilities field, this flag will cause audio/video data to
 // be submitted directly from the receive thread. This should only be specified if the
@@ -404,6 +407,12 @@ typedef void(*ConnListenerConnectionTerminated)(int errorCode);
 // due to a protected content error from the host. This value is supported on GFE 3.22+.
 #define ML_ERROR_PROTECTED_CONTENT -103
 
+// This error is passed to ConnListenerConnectionTerminated() if the stream ends
+// due a frame conversion error. This is most commonly due to an incompatible
+// desktop resolution and streaming resolution with HDR enabled. This value is
+// supported on GFE 3.22+.
+#define ML_ERROR_FRAME_CONVERSION -104
+
 // This callback is invoked to log debug message
 typedef void(*ConnListenerLogMessage)(const char* format, ...);
 
@@ -421,6 +430,12 @@ typedef void(*ConnListenerRumble)(unsigned short controllerNumber, unsigned shor
 #define CONN_STATUS_POOR    1
 typedef void(*ConnListenerConnectionStatusUpdate)(int connectionStatus);
 
+// This callback is invoked to notify the client of a change in HDR mode on
+// the host. The client will probably want to update the local display mode
+// to match the state of HDR on the host. This callback may be invoked even
+// if enableHdr is false in the stream configuration.
+typedef void(*ConnListenerSetHdrMode)(bool hdrEnabled);
+
 typedef struct _CONNECTION_LISTENER_CALLBACKS {
     ConnListenerStageStarting stageStarting;
     ConnListenerStageComplete stageComplete;
@@ -430,6 +445,7 @@ typedef struct _CONNECTION_LISTENER_CALLBACKS {
     ConnListenerLogMessage logMessage;
     ConnListenerRumble rumble;
     ConnListenerConnectionStatusUpdate connectionStatusUpdate;
+    ConnListenerSetHdrMode setHdrMode;
 } CONNECTION_LISTENER_CALLBACKS, *PCONNECTION_LISTENER_CALLBACKS;
 
 // Use this function to zero the connection callbacks when allocated on the stack or heap
@@ -500,6 +516,25 @@ int LiSendMouseMoveEvent(short deltaX, short deltaY);
 // referenceWidth and referenceHeight to your window width and height.
 int LiSendMousePositionEvent(short x, short y, short referenceWidth, short referenceHeight);
 
+// This function queues a mouse position update event to be sent to the remote server, so
+// all of the limitations of LiSendMousePositionEvent() mentioned above apply here too!
+//
+// This function behaves like a combination of LiSendMouseMoveEvent() and LiSendMousePositionEvent()
+// in that it sends a relative motion event, however it sends this data as an absolute position
+// based on the computed position of a virtual client cursor which is "moved" any time that
+// LiSendMousePositionEvent() or LiSendMouseMoveAsMousePositionEvent() is called. As a result
+// of this internal virtual cursor state, callers must ensure LiSendMousePositionEvent() and
+// LiSendMouseMoveAsMousePositionEvent() are not called concurrently!
+//
+// The big advantage of this function is that it allows callers to avoid mouse acceleration that
+// would otherwise affect motion when using LiSendMouseMoveEvent(). The downside is that it has the
+// same game compatibility issues as LiSendMousePositionEvent().
+//
+// This function can be useful when mouse capture is the only feasible way to receive mouse input,
+// like on Android or iOS, and the OS cannot provide raw unaccelerated mouse motion when capturing.
+// Using this function avoids double-acceleration in cases when the client motion is also accelerated.
+int LiSendMouseMoveAsMousePositionEvent(short deltaX, short deltaY, short referenceWidth, short referenceHeight);
+
 // This function queues a mouse button event to be sent to the remote server.
 #define BUTTON_ACTION_PRESS 0x07
 #define BUTTON_ACTION_RELEASE 0x08
@@ -511,6 +546,8 @@ int LiSendMousePositionEvent(short x, short y, short referenceWidth, short refer
 int LiSendMouseButtonEvent(char action, int button);
 
 // This function queues a keyboard event to be sent to the remote server.
+// Key codes are Win32 Virtual Key (VK) codes and interpreted as keys on
+// a US English layout.
 #define KEY_ACTION_DOWN 0x03
 #define KEY_ACTION_UP 0x04
 #define MODIFIER_SHIFT 0x01
@@ -518,6 +555,12 @@ int LiSendMouseButtonEvent(char action, int button);
 #define MODIFIER_ALT 0x04
 #define MODIFIER_META 0x08
 int LiSendKeyboardEvent(short keyCode, char keyAction, char modifiers);
+
+// Similar to LiSendKeyboardEvent() but allows the client to inform the host that
+// the keycode was not mapped to a standard US English scancode and should be
+// interpreted as-is. This is a Sunshine protocol extension.
+#define SS_KBE_FLAG_NON_NORMALIZED 0x01
+int LiSendKeyboardEvent2(short keyCode, char keyAction, char modifiers, char flags);
 
 // This function queues an UTF-8 encoded text to be sent to the remote server.
 int LiSendUtf8TextEvent(const char *text, unsigned int length);
@@ -564,9 +607,13 @@ int LiSendScrollEvent(signed char scrollClicks);
 // scrolling (Apple Trackpads, Microsoft Precision Touchpads, etc.).
 int LiSendHighResScrollEvent(short scrollAmount);
 
+// These functions send horizontal scroll events to the host which are
+// analogous to LiSendScrollEvent() and LiSendHighResScrollEvent().
+// This is a Sunshine protocol extension.
+int LiSendHScrollEvent(signed char scrollClicks);
+int LiSendHighResHScrollEvent(short scrollAmount);
+
 // This function returns a time in milliseconds with an implementation-defined epoch.
-// NOTE: This will be populated from gettimeofday() if !HAVE_CLOCK_GETTIME and
-// populated from clock_gettime(CLOCK_MONOTONIC) if HAVE_CLOCK_GETTIME.
 uint64_t LiGetMillis(void);
 
 // This is a simplistic STUN function that can assist clients in getting the WAN address
@@ -651,7 +698,47 @@ typedef void* VIDEO_FRAME_HANDLE;
 bool LiWaitForNextVideoFrame(VIDEO_FRAME_HANDLE* frameHandle, PDECODE_UNIT* decodeUnit);
 bool LiPollNextVideoFrame(VIDEO_FRAME_HANDLE* frameHandle, PDECODE_UNIT* decodeUnit);
 bool LiPeekNextVideoFrame(PDECODE_UNIT* decodeUnit);
+void LiWakeWaitForVideoFrame(void);
 void LiCompleteVideoFrame(VIDEO_FRAME_HANDLE handle, int drStatus);
+
+// This function returns the last reported HDR mode from the host PC.
+// See ConnListenerSetHdrMode() for more details.
+bool LiGetCurrentHostDisplayHdrMode(void);
+
+typedef struct _SS_HDR_METADATA {
+    // RGB order
+    struct {
+        uint16_t x; // Normalized to 50,000
+        uint16_t y; // Normalized to 50,000
+    } displayPrimaries[3];
+
+    struct {
+        uint16_t x; // Normalized to 50,000
+        uint16_t y; // Normalized to 50,000
+    } whitePoint;
+
+    uint16_t maxDisplayLuminance; // Nits
+    uint16_t minDisplayLuminance; // 1/10000th of a nit
+
+    // These are content-specific values which may not be available for all hosts.
+    uint16_t maxContentLightLevel; // Nits
+    uint16_t maxFrameAverageLightLevel; // Nits
+
+    // These are display-specific values which may not be available for all hosts.
+    uint16_t maxFullFrameLuminance; // Nits
+} SS_HDR_METADATA, *PSS_HDR_METADATA;
+
+// This function populates the provided mastering metadata struct with the HDR metadata
+// from the host PC's monitor and content (if available). It is only valid to call this
+// function when HDR mode is active on the host. This is a Sunshine protocol extension.
+bool LiGetHdrMetadata(PSS_HDR_METADATA metadata);
+
+// This function requests an IDR frame from the host. Typically this is done using DR_NEED_IDR, but clients
+// processing frames asynchronously may need to reset their decoder state even after returning DR_OK for
+// the prior frame. Rather than wait for a new frame and return DR_NEED_IDR for that one, they can just
+// call this API instead. Note that this function does not guarantee that the *next* frame will be an IDR
+// frame, just that an IDR frame will arrive soon.
+void LiRequestIdrFrame(void);
 
 #ifdef __cplusplus
 }
