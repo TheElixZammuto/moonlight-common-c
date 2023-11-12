@@ -32,6 +32,7 @@ uint16_t VideoPortNumber;
 SS_PING AudioPingPayload;
 SS_PING VideoPingPayload;
 uint32_t SunshineFeatureFlags;
+uint32_t StreamingFeatures;
 
 // Connection stages
 static const char* stageNames[STAGE_MAX] = {
@@ -324,7 +325,7 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
         Limelog("Disabling reference frame invalidation for 4K streaming with GFE\n");
         VideoCallbacks.capabilities &= ~CAPABILITY_REFERENCE_FRAME_INVALIDATION_AVC;
     }
-    
+
     Limelog("Initializing platform...");
     ListenerCallbacks.stageStarting(STAGE_PLATFORM_INIT);
     err = initializePlatform();

@@ -34,6 +34,14 @@ extern "C" {
 #define ENCFLG_AUDIO 0x00000001
 #define ENCFLG_ALL   0xFFFFFFFF
 
+#define STREAM_FEATURE_VIDEO 0x00000001
+#define STREAM_FEATURE_AUDIO 0x00000002
+#define STREAM_FEATURE_INPUT_KEYBOARD 0x00000004
+#define STREAM_FEATURE_INPUT_MOUSE 0x00000008
+#define STREAM_FEATURE_INPUT_GAMEPAD 0x00000010
+#define STREAM_FEATURE_INPUT_PEN 0x00000020
+#define STREAM_FEATURE_INPUT_TOUCH 0x00000040
+
 typedef struct _STREAM_CONFIGURATION {
     // Dimensions in pixels of the desired video stream
     int width;
@@ -103,6 +111,9 @@ typedef struct _STREAM_CONFIGURATION {
     // in /launch and /resume requests.
     char remoteInputAesKey[16];
     char remoteInputAesIv[16];
+
+    //Moonlight stream features to be enabled by the Stream
+    int streamingFeatures;
 } STREAM_CONFIGURATION, *PSTREAM_CONFIGURATION;
 
 // Use this function to zero the stream configuration when allocated on the stack or heap

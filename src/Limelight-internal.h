@@ -42,6 +42,7 @@ extern SS_PING AudioPingPayload;
 extern SS_PING VideoPingPayload;
 
 extern uint32_t SunshineFeatureFlags;
+extern uint32_t StreamingFeatures;
 
 // ENet channel ID values
 #define CTRL_CHANNEL_GENERIC      0x00

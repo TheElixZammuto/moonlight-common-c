@@ -425,6 +425,10 @@ void stopAudioStream(void) {
 }
 
 int startAudioStream(void* audioContext, int arFlags) {
+    if(!(StreamingFeatures & STREAM_FEATURE_AUDIO)){
+        Limelog("Skipped video due to missing feature");
+        return;
+    
     int err;
     OPUS_MULTISTREAM_CONFIGURATION chosenConfig;
 

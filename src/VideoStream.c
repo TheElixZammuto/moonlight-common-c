@@ -34,6 +34,10 @@ static bool receivedFullFrame;
 
 // Initialize the video stream
 void initializeVideoStream(void) {
+    if(!(StreamingFeatures & STREAM_FEATURE_VIDEO)){
+        Limelog("Skipped video due to missing feature");
+        return;
+    }
     initializeVideoDepacketizer(StreamConfig.packetSize);
     RtpvInitializeQueue(&rtpQueue);
     receivedDataFromPeer = false;
@@ -246,6 +250,10 @@ void stopVideoStream(void) {
 
 // Start the video stream
 int startVideoStream(void* rendererContext, int drFlags) {
+    if(!(StreamingFeatures & STREAM_FEATURE_VIDEO)){
+        Limelog("Skipped video due to missing feature");
+        return;
+    }
     int err;
 
     firstFrameSocket = INVALID_SOCKET;

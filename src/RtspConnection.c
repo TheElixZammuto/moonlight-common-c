@@ -936,11 +936,13 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
         if (!ReferenceFrameInvalidationSupported) {
             Limelog("Reference frame invalidation is not supported by this host\n");
         }
-
         // Look for the Sunshine feature flags in the SDP attributes
         if (!parseSdpAttributeToUInt(response.payload, "x-ss-general.featureFlags", &SunshineFeatureFlags)) {
             SunshineFeatureFlags = 0;
         }
+
+        // Look for the Sunshine feature flags in the SDP attributes
+        parseSdpAttributeToUInt(response.payload, "x-ss-stream.streamingFeatures", &StreamingFeatures);
 
         // Parse the Opus surround parameters out of the RTSP DESCRIBE response.
         ret = parseOpusConfigurations(&response);
