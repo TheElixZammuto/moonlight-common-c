@@ -34,7 +34,7 @@ static bool receivedFullFrame;
 
 // Initialize the video stream
 void initializeVideoStream(void) {
-    if(!(StreamingFeatures & STREAM_FEATURE_VIDEO)){
+    if(!(StreamConfig.streamingFeatures & STREAM_FEATURE_VIDEO)){
         Limelog("Skipped video due to missing feature");
         return;
     }
@@ -250,7 +250,7 @@ void stopVideoStream(void) {
 
 // Start the video stream
 int startVideoStream(void* rendererContext, int drFlags) {
-    if(!(StreamingFeatures & STREAM_FEATURE_VIDEO)){
+    if(!(StreamConfig.streamingFeatures & STREAM_FEATURE_VIDEO)){
         Limelog("Skipped video due to missing feature");
         return;
     }

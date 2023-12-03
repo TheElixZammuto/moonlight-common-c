@@ -941,9 +941,6 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
             SunshineFeatureFlags = 0;
         }
 
-        // Look for the Sunshine feature flags in the SDP attributes
-        parseSdpAttributeToUInt(response.payload, "x-ss-stream.streamingFeatures", &StreamingFeatures);
-
         // Parse the Opus surround parameters out of the RTSP DESCRIBE response.
         ret = parseOpusConfigurations(&response);
         if (ret != 0) {

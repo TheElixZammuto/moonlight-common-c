@@ -425,7 +425,7 @@ void stopAudioStream(void) {
 }
 
 int startAudioStream(void* audioContext, int arFlags) {
-    if(!(StreamingFeatures & STREAM_FEATURE_AUDIO)){
+    if(!(StreamConfig.streamingFeatures & STREAM_FEATURE_AUDIO)){
         Limelog("Skipped video due to missing feature");
         return;
     
