@@ -17,10 +17,10 @@ static bool decodingFrame;
 static int frameType;
 static uint16_t lastPacketPayloadLength;
 static bool strictIdrFrameWait;
-static uint64_t syntheticPtsBase;
+static uint64_t syntheticPtsBaseUs;
 static uint16_t frameHostProcessingLatency;
-static uint64_t firstPacketReceiveTime;
-static unsigned int firstPacketPresentationTime;
+static uint64_t firstPacketReceiveTimeUs;
+static uint64_t firstPacketPresentationTime;
 static uint32_t firstPacketRtpTimestamp;
 static bool dropStatePending;
 static bool idrFrameProcessed;
@@ -69,10 +69,11 @@ void initializeVideoDepacketizer(int pktSize) {
     waitingForRefInvalFrame = false;
     lastPacketInStream = UINT32_MAX;
     decodingFrame = false;
-    syntheticPtsBase = 0;
+    syntheticPtsBaseUs = 0;
     frameHostProcessingLatency = 0;
-    firstPacketReceiveTime = 0;
+    firstPacketReceiveTimeUs = 0;
     firstPacketPresentationTime = 0;
+    firstPacketRtpTimestamp = 0;
     lastPacketPayloadLength = 0;
     firstPacketRtpTimestamp = 0;
     dropStatePending = false;
@@ -485,10 +486,10 @@ static void reassembleFrame(int frameNumber) {
             qdu->decodeUnit.frameType = frameType;
             qdu->decodeUnit.frameNumber = frameNumber;
             qdu->decodeUnit.frameHostProcessingLatency = frameHostProcessingLatency;
-            qdu->decodeUnit.receiveTimeMs = firstPacketReceiveTime;
-            qdu->decodeUnit.presentationTimeMs = firstPacketPresentationTime;
+            qdu->decodeUnit.receiveTimeUs = firstPacketReceiveTimeUs;
+            qdu->decodeUnit.presentationTimeUs = firstPacketPresentationTime;
             qdu->decodeUnit.rtpTimestamp = firstPacketRtpTimestamp;
-            qdu->decodeUnit.enqueueTimeMs = LiGetMillis();
+            qdu->decodeUnit.enqueueTimeUs = PltGetMicroseconds();
 
             // These might be wrong for a few frames during a transition between SDR and HDR,
             // but the effects shouldn't very noticable since that's an infrequent operation.
@@ -746,7 +747,7 @@ static bool isFirstPacket(uint8_t flags, uint8_t fecBlockNumber) {
 // Process an RTP Payload
 // The caller will free *existingEntry unless we NULL it
 static void processRtpPayload(PNV_VIDEO_PACKET videoPacket, int length,
-                       uint64_t receiveTimeMs, unsigned int presentationTimeMs, uint32_t rtpTimestamp,
+                       uint64_t receiveTimeUs, uint64_t presentationTimeUs, uint32_t rtpTimestamp,
                        PLENTRY_INTERNAL* existingEntry) {
     BUFFER_DESC currentPos;
     uint32_t frameIndex;
@@ -829,19 +830,19 @@ static void processRtpPayload(PNV_VIDEO_PACKET videoPacket, int length,
         // We're now decoding a frame
         decodingFrame = true;
         frameType = FRAME_TYPE_PFRAME;
-        firstPacketReceiveTime = receiveTimeMs;
+        firstPacketReceiveTimeUs = receiveTimeUs;
 
         // Some versions of Sunshine don't send a valid PTS, so we will
         // synthesize one using the receive time as the time base.
-        if (!syntheticPtsBase) {
-            syntheticPtsBase = receiveTimeMs;
+        if (!syntheticPtsBaseUs) {
+            syntheticPtsBaseUs = receiveTimeUs;
         }
 
-        if (!presentationTimeMs && frameIndex > 0) {
-            firstPacketPresentationTime = (unsigned int)(receiveTimeMs - syntheticPtsBase);
+        if (!presentationTimeUs && frameIndex > 0) {
+            firstPacketPresentationTime = receiveTimeUs - syntheticPtsBaseUs;
         }
         else {
-            firstPacketPresentationTime = presentationTimeMs;
+            firstPacketPresentationTime = presentationTimeUs;
         }
 
         firstPacketRtpTimestamp = rtpTimestamp;
@@ -1165,7 +1166,7 @@ void queueRtpPacket(PRTPV_QUEUE_ENTRY queueEntryPtr) {
     RTPV_QUEUE_ENTRY queueEntry = *queueEntryPtr;
 
     LC_ASSERT(!queueEntry.isParity);
-    LC_ASSERT(queueEntry.receiveTimeMs != 0);
+    LC_ASSERT(queueEntry.receiveTimeUs != 0);
 
     dataOffset = sizeof(*queueEntry.packet);
     if (queueEntry.packet->header & FLAG_EXTENSION) {
@@ -1184,8 +1185,8 @@ void queueRtpPacket(PRTPV_QUEUE_ENTRY queueEntryPtr) {
 
     processRtpPayload((PNV_VIDEO_PACKET)(((char*)queueEntry.packet) + dataOffset),
                       queueEntry.length - dataOffset,
-                      queueEntry.receiveTimeMs,
-                      queueEntry.presentationTimeMs,
+                      queueEntry.receiveTimeUs,
+                      queueEntry.presentationTimeUs,
                       queueEntry.rtpTimestamp,
                       &existingEntry);
 
